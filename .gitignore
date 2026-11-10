@@ -1,10 +1,12 @@
 .env
+.env.*
+!.env.example
 .venv/
-tracker.db
 *.db
 *.db-journal
+*.db.backup
 __pycache__/
 *.pyc
 session*.json
 *.log
-tracker.db.backup
+*.log.*
