@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 session*.json
 *.log
+tracker.db.backup

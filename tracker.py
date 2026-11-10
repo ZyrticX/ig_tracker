@@ -45,10 +45,12 @@ TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_CHATS = [c.strip() for c in os.environ["TELEGRAM_CHAT_ID"].split(",") if c.strip()]
 PROXY = os.getenv("IG_PROXY", "").strip()
 NOTIFY_NEW = os.getenv("NOTIFY_NEW_FOLLOWERS", "true").lower() == "true"
+# מתחת לחלק הזה מבסיס התצפיות ההיסטורי הסריקה מסומנת "נראית חלקית" - אזהרה בלבד בדוח,
+# לא חסימה: ממילא לא מסיקים מסריקה חיה דבר על מי שלא נצפה בה.
 MIN_RATIO = float(os.getenv("MIN_FETCH_RATIO", "0.9"))
-FIRST_RUN_RATIO = float(os.getenv("FIRST_RUN_MIN_RATIO", "0.75"))
 # כמה משיכות לאחד בכל בדיקה. 7 משיכות × 5 בדיקות ביום הביאו לחסימת קצב (feedback_required).
-# 3 משיכות נותנות ~99%, והאישור בכמה בדיקות ברצף מכסה את מה שהוחמץ.
+# איחוד משיכות מצמצם החמצות אקראיות בין דפים, אבל אין אחוז כיסוי מובטח: קיטום שיטתי של
+# אינסטגרם אינו ניתן לתיקון בעוד משיכות, רק לזיהוי ולדיווח כ"לא חד-משמעי".
 FETCH_PASSES = max(1, int(os.getenv("FETCH_PASSES", "3")))
 PASS_DELAY = (float(os.getenv("PASS_DELAY_MIN_SEC", "120")), float(os.getenv("PASS_DELAY_MAX_SEC", "240")))
 # ירידת עוקב מדווחת רק אחרי שהוא חסר ב-N בדיקות ברצף (עוקב חדש: נראה ב-2 ברצף)
@@ -59,13 +61,22 @@ TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Jerusalem"))
 DB_PATH = BASE / os.getenv("DB_PATH", "tracker.db")
 SESSION_PATH = BASE / os.getenv("SESSION_PATH", "session.json")
 
+class _RedactFormatter(logging.Formatter):
+    """מסווה את טוקן הבוט בכל רשומת לוג, כולל traceback (requests כוללת את ה-URL המלא בשגיאות)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return super().format(record).replace(TG_TOKEN, "***")
+
+
 # לוג לקובץ תמיד (UTF-8, עם רוטציה), ולמסך רק כשיש מסך (pythonw רץ בלי)
 _handlers = [RotatingFileHandler(BASE / "tracker.log", maxBytes=1_000_000, backupCount=3,
                                  encoding="utf-8")]
 if sys.stderr:
     _handlers.append(logging.StreamHandler())
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                    handlers=_handlers)
+_fmt = _RedactFormatter("%(asctime)s %(levelname)s %(message)s")
+for _h in _handlers:
+    _h.setFormatter(_fmt)
+logging.basicConfig(level=logging.INFO, handlers=_handlers)
 log = logging.getLogger("ig-tracker")
 
 SCHEMA = """
@@ -78,10 +89,6 @@ CREATE TABLE IF NOT EXISTS runs(
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, total INTEGER, lost INTEGER, gained INTEGER);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
-
-
-class PartialFetch(Exception):
-    pass
 
 
 class PasswordChangeRequired(Exception):
@@ -116,6 +123,13 @@ def open_db() -> sqlite3.Connection:
     if "confirmed" not in [r[1] for r in db.execute("PRAGMA table_info(followers)")]:
         db.execute("ALTER TABLE followers ADD COLUMN confirmed INTEGER DEFAULT 1")
         db.commit()
+    # בסיס אמון ל-DB קיים: המשיכה הגדולה ביותר שהצליחה בעבר
+    if meta_get(db, "baseline_total") is None:
+        row = db.execute("SELECT MAX(total) FROM runs").fetchone()
+        if row and row[0]:
+            db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('baseline_total', ?)",
+                       (str(row[0]),))
+            db.commit()
     return db
 
 
@@ -156,7 +170,7 @@ def tg(text: str, chat_id: str | None = None, silent: bool = False,
                 )
                 r.raise_for_status()
             except Exception as e:
-                log.error("Telegram send failed: %s", e)
+                log.error("Telegram send failed: %s", e)  # ה-formatter מסווה את הטוקן
 
 
 def fmt_user(username: str, full_name: str) -> str:
@@ -222,49 +236,59 @@ def target_pk(cl: Client, db: sqlite3.Connection) -> str:
 
 
 # ---------- Core ----------
-def run(cl: Client, db: sqlite3.Connection) -> tuple[str, bool]:
-    """מושך עוקבים, שומר, ומחזיר (טקסט דוח, האם היו שינויים)."""
+def run(cl: Client, db: sqlite3.Connection) -> tuple[str, bool, bool]:
+    """מושך עוקבים ומעדכן נוכחות בלבד. מחזיר (טקסט דוח, נמצאו עוקבים חדשים, הסריקה נראית חלקית).
+
+    סריקה חיה היא תצפית בלבד: הופעה של עוקב ברשימה מוכיחה שהוא עוקב, אבל היעדרות ממנה
+    אינה מוכיחה שהוא הפסיק - אינסטגרם מקצצת ומדלגת בלי להודיע. לכן מהסריקות החיות לא
+    מסיקים ירידות, לא מזיזים מוני היעדרות ולא מסמנים עוקבים כלא פעילים. התראת "הורידו
+    עוקב" דורשת מקור שלם חיצוני (ייצוא רשמי), והיא לא קיימת בכלי כרגע.
+    """
     now = now_iso()
     pk = target_pk(cl, db)
 
     expected = cl.user_info(pk).follower_count or 0
     # אינסטגרם מחזירה את הרשימה בדפים, והיא זזה תוך כדי הדפדוף: חלק מהעוקבים חוזרים פעמיים וחלק
-    # מדולגים (בפועל ~85% בכל משיכה, ובכל פעם אחרים). מאחדים כמה משיכות, עם הפסקות ארוכות ביניהן.
-    # מספר העוקבים בפרופיל לא מהימן (מתעדכן באיחור) ולכן לא משפיע על שום החלטה.
+    # מדולגים. מאחדים כמה משיכות, עם הפסקות ארוכות ביניהן. האיחוד מצמצם החמצות אקראיות, אבל לא
+    # יכול לתקן קיטום שיטתי: חלק מהרשימה שאינסטגרם לא מחזירה בעקביות נשאר בלתי נראה.
     current: dict[str, tuple[str, str]] = {}
+    limited = False
     for i in range(FETCH_PASSES):
         order = "date_followed_latest" if i % 2 else None
         raw = cl.user_followers(pk, use_cache=False, amount=0, order=order)
+        # אינסטגרם יכולה לסמן שהיא מקצצת את הרשימה (should_limit_list_of_followers). הבדיקה כאן
+        # היא best-effort בלבד: last_json מחזיק את התשובה האחרונה, שעלולה להידרש על ידי נתיב גיבוי
+        # של instagrapi, ועמודים קודמים אינם נגישים. דגל כבוי אינו ראיה שהרשימה שלמה.
+        if (cl.last_json or {}).get("should_limit_list_of_followers"):
+            limited = True
         before = len(current)
         current.update({str(k): (u.username, u.full_name or "") for k, u in raw.items()})
         added = len(current) - before
-        log.info("Pass %d: +%d, %d unique (profile shows %d, not used for decisions)",
-                 i + 1, added, len(current), expected)
+        log.info("Pass %d: +%d, %d unique (profile shows %d)", i + 1, added, len(current), expected)
         if added == 0:
             break
         if i < FETCH_PASSES - 1:
             time.sleep(random.uniform(*PASS_DELAY))
     got = len(current)
-    log.info("Fetched %d / %d followers", got, expected)
+    missing_profile = max(0, expected - got)
+    coverage = (f"נצפו {got} מתוך {expected} שמוצגים בפרופיל (~{round(100 * got / expected)}%, "
+                f"{missing_profile} לא נצפו בסריקה)" if expected else f"נצפו {got} עוקבים")
 
-    # הגנה מהתראות שווא: משיכה חלקית לא נשמרת.
-    # follower_count כולל חשבונות שאינסטגרם לא מחזירה ברשימה (מושבתים, ספאם), אז הרשימה בדרך כלל
-    # 85-95% ממנו. לכן משווים למשיכה המוצלחת הקודמת, ורק בפעם הראשונה למספר המוצג (בסף מקל).
-    prev = db.execute("SELECT total FROM runs ORDER BY id DESC LIMIT 1").fetchone()
-    base, ratio = (prev[0], MIN_RATIO) if prev else (expected, FIRST_RUN_RATIO)
-    if base and got < base * ratio:
-        hint = " אם החשבון פרטי, החשבון המחובר חייב לעקוב אחריו." if got == 0 else ""
-        what = f"מתוך {base} בבדיקה הקודמת" if prev else f"מתוך {expected} שמוצגים בפרופיל"
-        raise PartialFetch(f"נמשכו {got} עוקבים {what}.{hint}")
+    # בסיס תצפיות: המשיכה הגדולה ביותר שאי פעם נצפתה. סימן עזר לזיהוי סריקה חלקית בלבד,
+    # לא בסיס להוכחת נכונות - אין כזו מסריקה חיה.
+    baseline = int(meta_get(db, "baseline_total") or 0)
+    partial = limited or bool(baseline and got < baseline * MIN_RATIO)
+    if got > baseline:
+        meta_set(db, baseline_total=got)
+    log.info("Fetched %d / %d followers%s", got, expected,
+             " [looks partial]" if partial else "")
 
-    # הרשימה היא האמת, אבל כל שינוי (בשני הכיוונים) מדווח רק אחרי שהוא חוזר בכמה בדיקות ברצף:
-    #   עוקב חדש  -> נרשם כ"ממתין" (confirmed=0), ומדווח כשהוא נראה גם בבדיקה הבאה.
-    #   עוקב שנעלם -> missed עולה ב-1 בכל בדיקה שהוא חסר, ומדווח כירידה אחרי LOST_CONFIRM ברצף.
+    # נוכחות בלבד: תצפית חיובית מאושרת לאחר שתי ראיות (כמו קודם); שורות של עוקבים שלא נצפו
+    # בסריקה לא נוגעות בהן בכלל - לא missed, לא active, לא אירועים.
     first_run = db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
     rows = {r[0]: r[1:] for r in db.execute(
         "SELECT pk, username, full_name, active, missed, confirmed FROM followers")}
-    lost, gained = [], []
-    upserts, state = [], []          # state: (active, missed, confirmed, pk)
+    gained, upserts, state = [], [], []     # state: (active, missed, confirmed, pk)
     for p, (u, n) in current.items():
         row = rows.get(p)
         if row is None:
@@ -272,22 +296,13 @@ def run(cl: Client, db: sqlite3.Connection) -> tuple[str, bool]:
         else:
             _, _, active, _, confirmed = row
             if active and confirmed:
-                state.append((1, 0, 1, p))
-            elif active:                         # ממתין מהבדיקה הקודמת, נראה שוב: מאושר
+                state.append((1, 0, 1, p))          # נצפה שוב: מרענן נוכחות
+            elif active:                            # ממתין, נצפה עוד פעם: מאושר (שתי תצפיות, לא בהכרח ברצף)
                 state.append((1, 0, 1, p))
                 gained.append((p, u, n))
-            else:                                # חזר לעקוב אחרי שירד: ממתין לאישור
+            else:                                   # סומן בעבר כ"ירד" (היסק ישן) ונצפה: ממתין לאישור
                 state.append((1, 0, 0, p))
-    for p, (u, n, active, missed, confirmed) in rows.items():
-        if p in current or not active:
-            continue
-        if not confirmed:                        # היה ממתין ונעלם: לא היה אמיתי, בלי דיווח
-            state.append((0, 0, 1, p))
-        elif missed + 1 >= LOST_CONFIRM:         # חסר ב-LOST_CONFIRM בדיקות ברצף: ירד
-            state.append((0, 0, 1, p))
-            lost.append((p, u, n))
-        else:
-            state.append((1, missed + 1, 1, p))
+    not_observed = sum(1 for p, r in rows.items() if r[2] and p not in current)
     db.executemany(
         """INSERT INTO followers(pk, username, full_name, first_seen, last_seen, active, missed, confirmed)
            VALUES(?, ?, ?, ?, ?, ?, ?, ?)""", upserts)
@@ -296,31 +311,40 @@ def run(cl: Client, db: sqlite3.Connection) -> tuple[str, bool]:
                    [(u, n, now, p) for p, (u, n) in current.items()])
 
     if not first_run:
-        db.executemany("INSERT INTO events(pk, username, type, ts) VALUES(?, ?, 'unfollow', ?)",
-                       [(p, u, now) for p, u, _ in lost])
         db.executemany("INSERT INTO events(pk, username, type, ts) VALUES(?, ?, 'follow', ?)",
                        [(p, u, now) for p, u, _ in gained])
 
-    db.execute("INSERT INTO runs(ts, total, lost, gained) VALUES(?, ?, ?, ?)",
-               (now, got, len(lost), len(gained)))
+    db.execute("INSERT INTO runs(ts, total, lost, gained) VALUES(?, ?, 0, ?)",
+               (now, got, len(gained)))
     db.commit()
 
     if first_run:
-        return (f"✅ <b>הטראקר הופעל</b> על @{html.escape(TARGET)}\n"
-                f"נשמר בסיס של {got} עוקבים."), True
+        # גם התצפית הראשונה מתוייגת במפורש כחלקית כשהיא לא כיסתה את המספר בפרופיל
+        partial = partial or bool(expected and got < expected * MIN_RATIO)
+        head = (f"⚠️ <b>הטראקר הופעל על @{html.escape(TARGET)}, התצפית הראשונה נראית חלקית</b>"
+                if partial else f"✅ <b>הטראקר הופעל</b> על @{html.escape(TARGET)}")
+        return (f"{head}\n"
+                f"נשמר בסיס תצפיות. {coverage}.\n"
+                "שים לב: תצפית חיה מוכיחה מי עוקב, לא מי הפסיק - שינויים אצל מי שלא נצפה "
+                "בסריקות לא יתגלו."), True, partial
 
+    unknown = (f"\n❓ {not_observed} עוקבים ידועים לא נצפו בסריקה (סטטוס לא ידוע)"
+               if not_observed else "")
+    note = ("\n⚠️ הסריקה נראית חלקית, כנראה בגלל קיטום של אינסטגרם. הנוכחות שנצפתה עודכנה, "
+            "אבל אי אפשר ללמוד ממנה על מי שלא נצפה.") if partial else ""
     lines = []
-    if lost:
-        lines.append(f"📉 <b>הורידו עוקב ({len(lost)})</b>")
-        lines += [fmt_user(u, n) for _, u, n in sorted(lost, key=lambda x: x[1])]
     if gained and NOTIFY_NEW:
-        lines.append(f"\n📈 <b>עוקבים חדשים ({len(gained)})</b>")
+        # "נצפו לראשונה" ולא "עוקבים חדשים": עוקב ותיק שלא נצפה בעבר יופיע כאן בפעם הראשונה
+        lines.append(f"📈 <b>נצפו לראשונה ({len(gained)})</b>")
         lines += [fmt_user(u, n) for _, u, n in sorted(gained, key=lambda x: x[1])]
     if not lines:
-        return f"✅ בדיקה עברה, אין שינויים. 👥 {got} עוקבים", False
-    lines.append(f"\n👥 סה״כ עוקבים: {got}")
-    return "\n".join(lines), True
-
+        return f"✅ בדיקה עברה, לא נצפו עוקבים חדשים. 👥 {coverage}{unknown}{note}", False, partial
+    lines.append(f"\n👥 {coverage}")
+    if unknown:
+        lines.append(unknown.strip())
+    if note:
+        lines.append(note.strip())
+    return "\n".join(lines), True, partial
 
 def explain(e: Exception) -> Result:
     """מתרגם חריגה להודעה ברורה + סוג: auth (צריך פעולה ממך) או retry (תקלה זמנית)."""
@@ -352,9 +376,6 @@ def explain(e: Exception) -> Result:
     if isinstance(e, PleaseWaitFewMinutes):
         return Result(False, "⏳ אינסטגרם ביקשה לחכות כמה דקות. הנתונים לא השתנו, ננסה שוב "
                              "מאוחר יותר.", "retry")
-    if isinstance(e, PartialFetch):
-        return Result(False, f"⚠️ משיכה חלקית: {html.escape(str(e))} "
-                             "הבדיקה לא נשמרה כדי למנוע התראות שווא.", "retry")
     log.error("Unexpected error", exc_info=e)
     return Result(False, f"❌ שגיאה: <code>{html.escape(str(e))[:500]}</code>", "retry")
 
@@ -365,8 +386,8 @@ def check(ask_code=None) -> Result:
     try:
         meta_set(db, last_attempt=now_iso())
         try:
-            text, changed = run(login(ask_code), db)
-            res = Result(True, text, "ok", changed)
+            text, changed, uncertain = run(login(ask_code), db)
+            res = Result(True, text, "uncertain" if uncertain else "ok", changed)
         except Exception as e:
             res = explain(e)
         log.info("Check done: ok=%s kind=%s changed=%s", res.ok, res.kind, res.changed)

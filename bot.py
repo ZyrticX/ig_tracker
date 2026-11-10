@@ -30,16 +30,16 @@ COMMANDS = [
     ("status", "מצב המערכת"),
     ("check", "בדיקת עוקבים עכשיו"),
     ("login", "בדיקת התחברות לאינסטגרם בלבד"),
-    ("lost", "מי הוריד עוקב (30 ימים אחרונים)"),
-    ("gained", "עוקבים חדשים (30 ימים אחרונים)"),
+    ("lost", "ירידות שזוהו בעבר (היסק ישן, לא מאומת)"),
+    ("gained", "עוקבים שנצפו לראשונה (30 ימים אחרונים)"),
     ("history", "כל השינויים האחרונים"),
     ("code", "שליחת קוד אימות: /code 123456"),
     ("help", "עזרה"),
 ]
 KEYBOARD = {"inline_keyboard": [
     [{"text": "🔄 בדיקה עכשיו", "callback_data": "check"}],
-    [{"text": "📉 מי הוריד עוקב", "callback_data": "lost"},
-     {"text": "📈 עוקבים חדשים", "callback_data": "gained"}],
+    [{"text": "📉 ירידות (לא מאומת)", "callback_data": "lost"},
+     {"text": "📈 נצפו לראשונה", "callback_data": "gained"}],
 ]}
 HELP = "🤖 <b>IG Tracker</b>\n" + "\n".join(f"/{c} — {d}" for c, d in COMMANDS)
 
@@ -67,6 +67,18 @@ def epoch_ts(epoch: float) -> str:
 def get_next_due() -> float:
     with closing(t.open_db()) as db:
         return float(t.meta_get(db, "next_due") or 0)
+
+
+def get_offset() -> int | None:
+    """העדכון האחרון של טלגרם שעובד. נשמר ב-DB כדי ש-restart לא יעבד מחדש פקודות ישנות."""
+    with closing(t.open_db()) as db:
+        v = t.meta_get(db, "tg_offset")
+        return int(v) if v else None
+
+
+def set_offset(offset: int) -> None:
+    with closing(t.open_db()) as db:
+        t.meta_set(db, tg_offset=offset)
 
 
 def set_next_due(delay: float) -> None:
@@ -127,7 +139,7 @@ def do_check(manual: bool) -> None:
     res = None
     try:
         res = t.check(ask_code=ask_code)
-        if res.ok and not res.changed:
+        if res.ok and not res.changed and res.kind != "uncertain":
             if manual or REPORT_NO_CHANGES:
                 t.tg(res.text, silent=True, markup=KEYBOARD)
         else:
@@ -201,7 +213,10 @@ def history_text(kind: str | None = None, days: int = 30) -> str:
         q, args = q + " AND type = ?", args + [kind]
     with closing(t.open_db()) as db:
         rows = db.execute(q + " ORDER BY id DESC LIMIT 40", args).fetchall()
-    title = {"unfollow": "📉 <b>הורידו עוקב</b>", "follow": "📈 <b>עוקבים חדשים</b>"}.get(
+    # אירועי unfollow ישנים נשמרו מתקופה שהכלי הסיק ירידות מסריקות חלקיות; הם לא מאומתים.
+    # הכלי כבר לא מייצר אירועי unfollow חדשים: היעדרות מסריקה חיה אינה הוכחה לירידה.
+    title = {"unfollow": "📉 <b>הורידו עוקב - היסק ישן, לא מאומת</b>",
+             "follow": "📈 <b>נצפו לראשונה</b>"}.get(
         kind, "🗂 <b>שינויים אחרונים</b>")
     if not rows:
         return f"{title}\nאין שינויים ב-{days} הימים האחרונים."
@@ -267,14 +282,31 @@ def handle_callback(cb: dict) -> None:
     try:
         requests.post(f"{API}/answerCallbackQuery", data={"callback_query_id": cb["id"]}, timeout=20)
     except requests.RequestException as e:
-        log.warning("answerCallbackQuery failed: %s", e)
+        log.warning("answerCallbackQuery failed: %s", e)  # ה-formatter מסווה את הטוקן
     data = cb.get("data") or ""
     if data in ("check", "lost", "gained"):
         handle({"chat": msg.get("chat", {}), "text": "/" + data})
 
 
+def process_updates(updates: list, offset: int | None) -> int | None:
+    """מעבד אצוות עדכונים. מדלג על עדכונים ישנים מה-offset (למשל אחרי restart), ושומר התקדמות."""
+    for upd in updates:
+        if offset is not None and upd["update_id"] < offset:
+            continue
+        offset = upd["update_id"] + 1
+        try:
+            if "callback_query" in upd:
+                handle_callback(upd["callback_query"])
+            else:
+                handle(upd.get("message") or {})
+        except Exception:
+            log.exception("Handler failed")
+        set_offset(offset)
+    return offset
+
+
 def poll() -> None:
-    offset = None
+    offset = get_offset()
     while True:
         try:
             r = requests.get(f"{API}/getUpdates", params={"timeout": 50, "offset": offset},
@@ -284,17 +316,9 @@ def poll() -> None:
                 time.sleep(30)
                 continue
             r.raise_for_status()
-            for upd in r.json()["result"]:
-                offset = upd["update_id"] + 1
-                try:
-                    if "callback_query" in upd:
-                        handle_callback(upd["callback_query"])
-                    else:
-                        handle(upd.get("message") or {})
-                except Exception:
-                    log.exception("Handler failed")
+            offset = process_updates(r.json()["result"], offset)
         except requests.RequestException as e:
-            log.warning("Telegram poll failed: %s", e)
+            log.warning("Telegram poll failed: %s", e)  # ה-formatter מסווה את הטוקן
             time.sleep(10)
 
 
@@ -316,7 +340,7 @@ def main() -> None:
         requests.post(f"{API}/setMyCommands", timeout=20, json={
             "commands": [{"command": c, "description": d} for c, d in COMMANDS]})
     except requests.RequestException as e:
-        log.warning("setMyCommands failed: %s", e)
+        log.warning("setMyCommands failed: %s", e)  # ה-formatter מסווה את הטוקן
 
     due = get_next_due()
     when = (f"בדיקה הבאה: {epoch_ts(due)}" if due > time.time()
