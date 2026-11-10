@@ -1,0 +1,9 @@
+.env
+.venv/
+tracker.db
+*.db
+*.db-journal
+__pycache__/
+*.pyc
+session*.json
+*.log
